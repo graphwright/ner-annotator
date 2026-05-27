@@ -2,6 +2,7 @@
 
 ![Screenshot](https://raw.githubusercontent.com/graphwright/ner-annotator/main/screenshot.png)
 
+Try it [live](https://graphwright.github.io/ner-annotator/)!
 
 **Link:** [https://claude.ai/chat/0bcae533-311f-4a8e-8367-038e4174e324](https://claude.ai/chat/0bcae533-311f-4a8e-8367-038e4174e324)  
 
