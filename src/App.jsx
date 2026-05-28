@@ -101,11 +101,212 @@ const STAGE_INFO = [
 ];
 
 const SERVICE_HELP_TEXT = "Cloudflare Tunnel recommended (alternatives: ngrok, bore.sh, Tailscale Funnel, frp).";
+const IDENTITY_SETUP_URL = "https://github.com/graphwright/ner-annotator#identity-service-stage-3";
+const CLUSTER_COLORS = ["#f59e0b", "#f472b6", "#60a5fa", "#34d399", "#a78bfa", "#f97316", "#22d3ee", "#94a3b8"];
+
+const PROVIDERS = {
+  anthropic: {
+    label: "Anthropic",
+    defaultModel: "claude-3-5-sonnet-latest",
+    endpoint: "https://api.anthropic.com/v1/messages",
+  },
+  openai: {
+    label: "OpenAI",
+    defaultModel: "gpt-4.1",
+    endpoint: "https://api.openai.com/v1/chat/completions",
+  },
+};
 
 const toClustersById = (clusters) => Object.fromEntries(clusters.map((cluster) => [cluster.id, { ...cluster }]));
 const toMentionsById = (mentions) => Object.fromEntries(mentions.map((mention) => [mention.id, { ...mention }]));
 
 const isFiniteNumber = (value) => typeof value === "number" && Number.isFinite(value);
+const isSafeInteger = (value) => Number.isInteger(value) && Number.isFinite(value);
+
+const splitSentences = (rawText) => {
+  const normalized = rawText.replace(/\r\n/g, "\n").trim();
+  if (!normalized) throw new Error("Raw text is empty.");
+  const matches = normalized.match(/[^.!?\n]+[.!?]?/g) || [];
+  const sentences = matches
+    .map((text, index) => ({ id: index, text: text.trim() }))
+    .filter((sentence) => sentence.text.length > 0);
+  if (!sentences.length) throw new Error("Could not derive sentences from raw text.");
+  return sentences;
+};
+
+const extractJsonString = (text) => {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced) return fenced[1].trim();
+
+  const direct = text.trim();
+  if (direct.startsWith("{") || direct.startsWith("[")) return direct;
+
+  const firstBrace = direct.indexOf("{");
+  const lastBrace = direct.lastIndexOf("}");
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    return direct.slice(firstBrace, lastBrace + 1);
+  }
+
+  throw new Error("Model response did not contain JSON.");
+};
+
+const parseModelJson = (text) => {
+  const jsonCandidate = extractJsonString(text);
+  try {
+    return JSON.parse(jsonCandidate);
+  } catch {
+    throw new Error("Model returned invalid JSON.");
+  }
+};
+
+const parseStage1Mentions = (payload, sentences) => {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.mentions)) {
+    throw new Error("Stage 1 response must be an object with a mentions array.");
+  }
+
+  const sentenceById = Object.fromEntries(sentences.map((sentence) => [sentence.id, sentence]));
+  const mentions = payload.mentions.map((mention, index) => {
+    if (!mention || typeof mention !== "object") throw new Error(`mentions[${index}] must be an object.`);
+    if (!isSafeInteger(mention.sid) || !sentenceById[mention.sid]) throw new Error(`mentions[${index}].sid is invalid.`);
+    if (!isSafeInteger(mention.start) || !isSafeInteger(mention.end)) throw new Error(`mentions[${index}] start/end must be integers.`);
+    if (mention.end <= mention.start) throw new Error(`mentions[${index}] end must be greater than start.`);
+    if (typeof mention.text !== "string" || !mention.text.trim()) throw new Error(`mentions[${index}].text is required.`);
+    if (typeof mention.pos !== "string" || !mention.pos.trim()) throw new Error(`mentions[${index}].pos is required.`);
+
+    const sentenceText = sentenceById[mention.sid].text;
+    if (mention.start < 0 || mention.end > sentenceText.length) {
+      throw new Error(`mentions[${index}] span is outside sentence bounds.`);
+    }
+
+    return {
+      id: typeof mention.id === "string" && mention.id.trim() ? mention.id.trim() : `m_${mention.sid}_${mention.start}_${mention.end}`,
+      sid: mention.sid,
+      start: mention.start,
+      end: mention.end,
+      text: mention.text.trim(),
+      pos: mention.pos.trim().toUpperCase(),
+    };
+  });
+
+  const seen = new Set();
+  mentions.forEach((mention) => {
+    if (seen.has(mention.id)) throw new Error(`Duplicate mention id: ${mention.id}`);
+    seen.add(mention.id);
+  });
+
+  return mentions.sort((a, b) => a.sid - b.sid || a.start - b.start || a.end - b.end);
+};
+
+const parseStage2Clusters = (payload, mentionIds, mentionsById) => {
+  if (!payload || typeof payload !== "object" || !Array.isArray(payload.clusters)) {
+    throw new Error("Stage 2 response must be an object with a clusters array.");
+  }
+
+  const knownMentionIds = new Set(mentionIds);
+  const usedMentions = new Set();
+
+  const clusters = payload.clusters.map((cluster, index) => {
+    if (!cluster || typeof cluster !== "object") throw new Error(`clusters[${index}] must be an object.`);
+    const mentionIdArray = Array.isArray(cluster.mentionIds) ? cluster.mentionIds : cluster.mention_ids;
+    if (!Array.isArray(mentionIdArray)) throw new Error(`clusters[${index}] must include mentionIds.`);
+
+    const normalizedMentionIds = mentionIdArray.map((mentionId, mentionIndex) => {
+      if (typeof mentionId !== "string" || !knownMentionIds.has(mentionId)) {
+        throw new Error(`clusters[${index}].mentionIds[${mentionIndex}] is unknown.`);
+      }
+      if (usedMentions.has(mentionId)) throw new Error(`Mention ${mentionId} appears in multiple clusters.`);
+      usedMentions.add(mentionId);
+      return mentionId;
+    });
+
+    const id = typeof cluster.id === "string" && cluster.id.trim() ? cluster.id.trim() : `c_${index}`;
+    const label = typeof cluster.label === "string" && cluster.label.trim() ? cluster.label.trim() : `Cluster ${index + 1}`;
+    const confidence = isFiniteNumber(cluster.confidence) ? Math.max(0, Math.min(1, cluster.confidence)) : 0.5;
+
+    return {
+      id,
+      label,
+      color: CLUSTER_COLORS[index % CLUSTER_COLORS.length],
+      mentionIds: normalizedMentionIds,
+      canonicalId: null,
+      confidence,
+      provisional: true,
+    };
+  });
+
+  mentionIds.forEach((mentionId) => {
+    if (usedMentions.has(mentionId)) return;
+    clusters.push({
+      id: `c_singleton_${mentionId}`,
+      label: mentionsById[mentionId]?.text || "Singleton",
+      color: "#94a3b8",
+      mentionIds: [mentionId],
+      canonicalId: null,
+      confidence: 0.25,
+      provisional: true,
+    });
+  });
+
+  const seenClusterIds = new Set();
+  clusters.forEach((cluster) => {
+    if (seenClusterIds.has(cluster.id)) throw new Error(`Duplicate cluster id: ${cluster.id}`);
+    seenClusterIds.add(cluster.id);
+  });
+
+  return clusters;
+};
+
+const extractProviderText = (provider, payload) => {
+  if (provider === "anthropic") {
+    if (!Array.isArray(payload?.content)) throw new Error("Anthropic response missing content.");
+    const textBlock = payload.content.find((block) => block?.type === "text");
+    if (!textBlock?.text) throw new Error("Anthropic response missing text content.");
+    return textBlock.text;
+  }
+
+  const message = payload?.choices?.[0]?.message?.content;
+  if (typeof message !== "string" || !message.trim()) throw new Error("OpenAI response missing message content.");
+  return message;
+};
+
+const buildStage1Prompt = (customInstructions, sentences) => `${customInstructions}
+
+Return JSON only with this exact shape:
+{
+  "mentions": [
+    { "id": "m_...", "sid": 0, "start": 0, "end": 5, "text": "...", "pos": "NOUN|PROPN|PRON" }
+  ]
+}
+
+Rules:
+- Keep character offsets exact for each sentence.
+- Include only noun/proper-noun/pronoun mentions.
+- sid must reference sentence id below.
+- Output no markdown, no explanation.
+
+Sentences:
+${JSON.stringify(sentences, null, 2)}`;
+
+const buildStage2Prompt = (customInstructions, sentences, mentions) => `${customInstructions}
+
+Return JSON only with this exact shape:
+{
+  "clusters": [
+    { "id": "c_...", "label": "...", "mentionIds": ["m_1", "m_2"], "confidence": 0.0 }
+  ]
+}
+
+Rules:
+- Use only mention IDs provided below.
+- Each mention ID may appear in at most one cluster.
+- confidence must be between 0 and 1.
+- Output no markdown, no explanation.
+
+Sentences:
+${JSON.stringify(sentences, null, 2)}
+
+Mentions:
+${JSON.stringify(mentions, null, 2)}`;
 
 const normalizeDocument = (raw) => {
   if (!raw || typeof raw !== "object") throw new Error("JSON root must be an object.");
@@ -233,11 +434,21 @@ export default function NERAnnotator() {
   const [importError, setImportError] = useState("");
   const [importMessage, setImportMessage] = useState("");
 
+  const [provider, setProvider] = useState("anthropic");
+  const [model, setModel] = useState(PROVIDERS.anthropic.defaultModel);
+  const [apiKey, setApiKey] = useState("");
+  const [stage1Prompt, setStage1Prompt] = useState("Identify noun, proper noun, and pronoun mentions.");
+  const [stage2Prompt, setStage2Prompt] = useState("Group mentions that refer to the same entity.");
+  const [llmState, setLlmState] = useState({ type: "", message: "" });
+  const [runningMentions, setRunningMentions] = useState(false);
+  const [runningCoref, setRunningCoref] = useState(false);
+
   const [identityServiceUrl, setIdentityServiceUrl] = useState("");
-  const [resolveState, setResolveState] = useState({ type: "", message: "" });
+  const [resolveState, setResolveState] = useState({ type: "", message: "", linkHref: "", linkLabel: "" });
   const [resolving, setResolving] = useState(false);
 
-  const fileInputRef = useRef(null);
+  const jsonInputRef = useRef(null);
+  const rawTextInputRef = useRef(null);
 
   useEffect(() => {
     const link = document.createElement("link");
@@ -245,6 +456,54 @@ export default function NERAnnotator() {
     link.rel = "stylesheet";
     document.head.appendChild(link);
   }, []);
+
+  const handleProviderChange = (nextProvider) => {
+    setProvider(nextProvider);
+    setModel(PROVIDERS[nextProvider].defaultModel);
+  };
+
+  const callModel = async (prompt) => {
+    if (!apiKey.trim()) throw new Error("Provide an API key first.");
+    if (!model.trim()) throw new Error("Provide a model name first.");
+
+    if (provider === "anthropic") {
+      const response = await fetch(PROVIDERS.anthropic.endpoint, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": apiKey.trim(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: model.trim(),
+          max_tokens: 2000,
+          temperature: 0,
+          messages: [{ role: "user", content: prompt }],
+        }),
+      });
+
+      if (!response.ok) throw new Error(`LLM request failed (${response.status}).`);
+      return extractProviderText("anthropic", await response.json());
+    }
+
+    const response = await fetch(PROVIDERS.openai.endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: "Bearer " + apiKey.trim(),
+      },
+      body: JSON.stringify({
+        model: model.trim(),
+        max_tokens: 2000,
+        temperature: 0,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    if (!response.ok) throw new Error(`LLM request failed (${response.status}).`);
+    return extractProviderText("openai", await response.json());
+  };
 
   const mentionToCluster = useMemo(() => {
     const map = {};
@@ -343,10 +602,11 @@ export default function NERAnnotator() {
     setSelectedMid(null);
     setMergeTarget("");
     setCanonicalInput("");
-    setResolveState({ type: "", message: "" });
+    setResolveState({ type: "", message: "", linkHref: "", linkLabel: "" });
+    setLlmState({ type: "", message: "" });
   };
 
-  const handleImport = async (event) => {
+  const handleImportJson = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
@@ -357,11 +617,85 @@ export default function NERAnnotator() {
       const raw = JSON.parse(text);
       const normalized = normalizeDocument(raw);
       applyDocument(normalized);
-      setImportMessage(`Loaded ${file.name}`);
+      setImportMessage(`Loaded JSON: ${file.name}`);
     } catch (error) {
       setImportError(error instanceof Error ? error.message : "Could not import JSON file.");
     } finally {
       event.target.value = "";
+    }
+  };
+
+  const handleImportRawText = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    resetImportFeedback();
+
+    try {
+      const text = await file.text();
+      const parsedSentences = splitSentences(text);
+      applyDocument({ sentences: parsedSentences, mentions: [], clusters: [], entities: {} });
+      setStage(1);
+      setImportMessage(`Loaded raw text: ${file.name}`);
+    } catch (error) {
+      setImportError(error instanceof Error ? error.message : "Could not import raw text file.");
+    } finally {
+      event.target.value = "";
+    }
+  };
+
+  const handleRunMentions = async () => {
+    if (!sentences.length) {
+      setLlmState({ type: "error", message: "Load raw text or JSON before running stage 1." });
+      return;
+    }
+
+    setRunningMentions(true);
+    setLlmState({ type: "", message: "" });
+
+    try {
+      const responseText = await callModel(buildStage1Prompt(stage1Prompt, sentences));
+      const parsed = parseModelJson(responseText);
+      const mentions = parseStage1Mentions(parsed, sentences);
+      setMentionOrder(mentions.map((mention) => mention.id));
+      setMentionsById(toMentionsById(mentions));
+      setClusters({});
+      setEntities({});
+      setResolveState({ type: "", message: "", linkHref: "", linkLabel: "" });
+      setSelectedMid(null);
+      setStage(1);
+      setLlmState({ type: "success", message: `Stage 1 complete: ${mentions.length} mentions.` });
+    } catch (error) {
+      setLlmState({ type: "error", message: error instanceof Error ? error.message : "Stage 1 failed." });
+    } finally {
+      setRunningMentions(false);
+    }
+  };
+
+  const handleRunCoref = async () => {
+    if (!mentionOrder.length) {
+      setLlmState({ type: "error", message: "Run stage 1 first to generate mentions." });
+      return;
+    }
+
+    setRunningCoref(true);
+    setLlmState({ type: "", message: "" });
+
+    try {
+      const mentionList = mentionOrder.map((mentionId) => mentionsById[mentionId]).filter(Boolean);
+      const responseText = await callModel(buildStage2Prompt(stage2Prompt, sentences, mentionList));
+      const parsed = parseModelJson(responseText);
+      const corefClusters = parseStage2Clusters(parsed, mentionOrder, mentionsById);
+      setClusters(toClustersById(corefClusters));
+      setEntities({});
+      setResolveState({ type: "", message: "", linkHref: "", linkLabel: "" });
+      setSelectedMid(null);
+      setStage(2);
+      setLlmState({ type: "success", message: `Stage 2 complete: ${corefClusters.length} clusters.` });
+    } catch (error) {
+      setLlmState({ type: "error", message: error instanceof Error ? error.message : "Stage 2 failed." });
+    } finally {
+      setRunningCoref(false);
     }
   };
 
@@ -476,12 +810,17 @@ export default function NERAnnotator() {
     if (!selectedCluster) return;
 
     if (!identityServiceUrl.trim()) {
-      setResolveState({ type: "error", message: "Provide an identity service URL first." });
+      setResolveState({
+        type: "warn",
+        message: "You need a working identity service to resolve canonical IDs.",
+        linkHref: IDENTITY_SETUP_URL,
+        linkLabel: "How to set up identity service",
+      });
       return;
     }
 
     setResolving(true);
-    setResolveState({ type: "", message: "" });
+    setResolveState({ type: "", message: "", linkHref: "", linkLabel: "" });
 
     try {
       const response = await fetch(identityServiceUrl.trim(), {
@@ -497,7 +836,12 @@ export default function NERAnnotator() {
       const payload = normalizeServiceResponse(await response.json());
 
       if (!payload.canonicalId) {
-        setResolveState({ type: "warn", message: "No canonical match returned; cluster remains provisional." });
+        setResolveState({
+          type: "warn",
+          message: "No canonical match returned; cluster remains provisional.",
+          linkHref: "",
+          linkLabel: "",
+        });
         return;
       }
 
@@ -521,11 +865,13 @@ export default function NERAnnotator() {
         },
       }));
 
-      setResolveState({ type: "success", message: `Resolved to ${payload.canonicalId}` });
+      setResolveState({ type: "success", message: `Resolved to ${payload.canonicalId}`, linkHref: "", linkLabel: "" });
     } catch (error) {
       setResolveState({
-        type: "error",
-        message: error instanceof Error ? error.message : "Identity service request failed.",
+        type: "warn",
+        message: (error instanceof Error ? error.message : "Identity service request failed.") + " Cluster remains provisional.",
+        linkHref: IDENTITY_SETUP_URL,
+        linkLabel: "Identity service setup guide",
       });
     } finally {
       setResolving(false);
@@ -565,6 +911,16 @@ export default function NERAnnotator() {
       fontWeight: active ? 600 : 400,
     }),
     stageDesc: { fontSize: 10, color: "#484f58", fontStyle: "italic", marginLeft: "auto" },
+    smallInput: {
+      background: "#0d1117",
+      border: "1px solid #30363d",
+      color: "#c9d1d9",
+      borderRadius: 4,
+      padding: "5px 8px",
+      fontSize: 11,
+      fontFamily: "inherit",
+      outline: "none",
+    },
     toolBtn: {
       padding: "5px 10px",
       borderRadius: 4,
@@ -648,6 +1004,20 @@ export default function NERAnnotator() {
       fontFamily: "inherit",
       outline: "none",
     },
+    textarea: {
+      width: "100%",
+      minHeight: 74,
+      resize: "vertical",
+      background: "#0d1117",
+      border: "1px solid #30363d",
+      color: "#c9d1d9",
+      borderRadius: 4,
+      padding: "7px 8px",
+      fontSize: 11,
+      fontFamily: "monospace",
+      lineHeight: 1.5,
+      outline: "none",
+    },
   };
 
   return (
@@ -665,9 +1035,36 @@ export default function NERAnnotator() {
             </button>
           ))}
         </div>
-        <button style={s.toolBtn} onClick={() => fileInputRef.current?.click()}>Load JSON</button>
+        <select
+          value={provider}
+          onChange={(event) => handleProviderChange(event.target.value)}
+          style={{ ...s.smallInput, width: 110 }}
+          aria-label="LLM provider"
+        >
+          {Object.entries(PROVIDERS).map(([key, providerInfo]) => (
+            <option key={key} value={key}>{providerInfo.label}</option>
+          ))}
+        </select>
+        <input
+          value={model}
+          onChange={(event) => setModel(event.target.value)}
+          placeholder="Model"
+          style={{ ...s.smallInput, width: 150 }}
+          aria-label="Model name"
+        />
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(event) => setApiKey(event.target.value)}
+          placeholder="API key (session)"
+          style={{ ...s.smallInput, width: 170 }}
+          aria-label="API key"
+        />
+        <button style={s.toolBtn} onClick={() => rawTextInputRef.current?.click()}>Import Raw Text</button>
+        <button style={s.toolBtn} onClick={() => jsonInputRef.current?.click()}>Import JSON</button>
         <button style={s.toolBtn} onClick={handleExport}>Download JSON</button>
-        <input ref={fileInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleImport} />
+        <input ref={rawTextInputRef} type="file" accept=".txt,text/plain" style={{ display: "none" }} onChange={handleImportRawText} />
+        <input ref={jsonInputRef} type="file" accept="application/json" style={{ display: "none" }} onChange={handleImportJson} />
         <div style={s.stageDesc}>{STAGE_INFO[stage - 1].desc}</div>
       </header>
 
@@ -676,7 +1073,19 @@ export default function NERAnnotator() {
           {importError && <div style={s.callout("#f85149")}>{importError}</div>}
           {importMessage && <div style={s.callout("#3fb950")}>{importMessage}</div>}
           {stage === 3 && !identityServiceUrl.trim() && (
-            <div style={s.callout("#f0883e")}>Identity service URL not set. Stage 3 resolution requires a running service.</div>
+            <div style={s.callout("#f0883e")}>
+              You need a working identity service to do stage 3.
+              {" "}
+              <a
+                href={IDENTITY_SETUP_URL}
+                target="_blank"
+                rel="noreferrer"
+                style={{ color: "#58a6ff" }}
+                aria-label="Setup instructions (opens in new tab)"
+              >
+                Setup instructions
+              </a>
+            </div>
           )}
 
           <div style={s.legend}>
@@ -760,6 +1169,29 @@ export default function NERAnnotator() {
         </div>
 
         <div style={s.panel}>
+          <div>
+            <div style={s.sectionLabel}>LLM Pipeline</div>
+            <div style={s.panelSection("#30363d")}>
+              <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                <button onClick={handleRunMentions} disabled={runningMentions} style={s.btn(!runningMentions, "#58a6ff")}>
+                  {runningMentions ? "Running stage 1..." : "Run mentions"}
+                </button>
+                <button onClick={handleRunCoref} disabled={runningCoref || !mentionOrder.length} style={s.btn(!runningCoref && !!mentionOrder.length, "#58a6ff")}>
+                  {runningCoref ? "Running stage 2..." : "Run coref"}
+                </button>
+              </div>
+              {llmState.message && (
+                <div style={{ fontSize: 10, color: llmState.type === "error" ? "#f85149" : "#3fb950", marginBottom: 8 }}>
+                  {llmState.message}
+                </div>
+              )}
+              <div style={{ fontSize: 10, color: "#8b949e", marginBottom: 4 }}>Stage 1 prompt</div>
+              <textarea value={stage1Prompt} onChange={(event) => setStage1Prompt(event.target.value)} style={s.textarea} aria-label="Stage 1 prompt" />
+              <div style={{ fontSize: 10, color: "#8b949e", marginBottom: 4, marginTop: 10 }}>Stage 2 prompt</div>
+              <textarea value={stage2Prompt} onChange={(event) => setStage2Prompt(event.target.value)} style={s.textarea} aria-label="Stage 2 prompt" />
+            </div>
+          </div>
+
           {stage === 3 && (
             <div>
               <div style={s.sectionLabel}>Identity Service</div>
@@ -778,6 +1210,20 @@ export default function NERAnnotator() {
                 {resolveState.message && (
                   <div style={{ fontSize: 10, color: resolveState.type === "error" ? "#f85149" : resolveState.type === "warn" ? "#f0883e" : "#3fb950" }}>
                     {resolveState.message}
+                    {resolveState.linkHref && (
+                      <>
+                        {" "}
+                        <a
+                          href={resolveState.linkHref}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{ color: "#58a6ff" }}
+                          aria-label={`${resolveState.linkLabel || "Learn more"} (opens in new tab)`}
+                        >
+                          {resolveState.linkLabel || "Learn more"}
+                        </a>
+                      </>
+                    )}
                   </div>
                 )}
               </div>

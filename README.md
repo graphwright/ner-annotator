@@ -13,7 +13,10 @@ NER Annotator is a browser UI for a 3-stage entity workflow:
 
 - Offset-based mention rendering (`start`/`end` character spans)
 - Cluster editing (merge, split, canonical override)
-- Import/export of annotation JSON (round-trip compatible)
+- Import raw text (`.txt`) and JSON annotation files
+- Stage 1 LLM mention extraction (nouns/proper nouns/pronouns) with strict JSON parsing and schema validation
+- Stage 2 LLM coreference clustering with strict JSON parsing, schema validation, and separate run action
+- Session-only LLM configuration (provider, model, API key) in the header
 - Stage 3 identity-service integration via URL (resolve selected cluster on demand)
 - Canonical metadata display (ID, label, URL, description)
 
@@ -67,6 +70,37 @@ Notes:
 - Imported documents are validated before loading.
 - Overlapping or invalid mention spans are clipped/skipped safely in rendering.
 
+## LLM stages (1 and 2)
+
+Stages 1 and 2 can call Anthropic or OpenAI directly from the browser.
+
+- API key is session-only (not persisted to localStorage)
+- Provider and model are selectable in the header
+- Stage 1 and Stage 2 prompts are editable independently in the right panel
+- Stage 2 (`Run coref`) is intentionally separate so stage-1 output can be reviewed/edited first
+- Raw text sentence splitting is intentionally lightweight and may need cleanup for abbreviations/edge punctuation
+- Browser API-key mode is for experimentation; keys are exposed to browser/network tooling and should not be production secrets
+
+### Stage 1 response schema
+
+```json
+{
+  "mentions": [
+    { "id": "m_0", "sid": 0, "start": 0, "end": 4, "text": "John", "pos": "PROPN" }
+  ]
+}
+```
+
+### Stage 2 response schema
+
+```json
+{
+  "clusters": [
+    { "id": "c_0", "label": "John", "mentionIds": ["m_0"], "confidence": 0.9 }
+  ]
+}
+```
+
 ## Identity service (stage 3)
 
 Stage 3 resolves canonical IDs by calling an identity service URL you provide.
@@ -97,7 +131,4 @@ A separate relay/tunnel service is required.
 
 ## Deferred items
 
-- Direct browser-to-LLM provider calls (Claude/OpenAI)
 - Local persistence of API keys or session state
-
-Both are feasible and may be added later, but are intentionally deferred.
