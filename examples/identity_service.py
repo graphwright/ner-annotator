@@ -76,7 +76,8 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(payload, dict):
                 raise ValueError("payload must be an object")
         except Exception as exc:  # noqa: BLE001
-            self.respond(400, {"error": f"invalid JSON payload: {exc}"})
+            print(f"[identity] invalid JSON payload: {exc}")
+            self.respond(400, {"error": "invalid JSON payload"})
             return
 
         response = resolve_label(str(payload.get("label") or ""))
