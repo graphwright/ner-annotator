@@ -76,19 +76,19 @@ const SAMPLE_DOCUMENT = {
       label: "Sherlock Holmes",
       type: "character",
       description: "Consulting detective, 221B Baker Street. Central figure of 60 canonical works.",
-      url: "https://www.sherlockian.net/canon/characters/holmes/",
+      url: "https://bakerstreet.fandom.com/wiki/Sherlock_Holmes",
     },
     "character:irene_adler": {
       label: "Irene Adler",
       type: "character",
       description: "Opera contralto and adventuress. Appears in A Scandal in Bohemia (SCAN).",
-      url: "https://www.sherlockian.net/canon/characters/adler/",
+      url: "https://bakerstreet.fandom.com/wiki/Irene_Adler",
     },
     "character:john_watson": {
       label: "Dr. John H. Watson",
       type: "character",
       description: "Army surgeon, retired. Holmes's companion and first-person narrator.",
-      url: "https://www.sherlockian.net/canon/characters/watson/",
+      url: "https://bakerstreet.fandom.com/wiki/John_H._Watson",
     },
   },
 };
